@@ -44,26 +44,26 @@ from rich.progress import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-# ArcGIS MapServer for GeoPDF indexes
-GEOPDF_INDEX_URL = (
-    "https://arcgis.dnr.state.mn.us/arcgis/rest/services/"
-    "gen/mndnr_geopdf_downloader_indexes/MapServer"
-)
-PROXY_URL = "https://arcgis.dnr.state.mn.us/gis/pdf/proxy.ashx"
-REFERER = "https://arcgis.dnr.state.mn.us/gis/pdf/"
+# New ArcGIS FeatureServer for GeoPDF indexes
+TOKEN_URL = "https://r29p-gis-portal-oauth-func-001.azurewebsites.net/api/getToken?app_id=mntopo"
+FEATURE_SERVER_URL = "https://gis.dnr.state.mn.us/host/rest/services/Hosted/mobile_maps_webmap_WFL1/FeatureServer/1/query"
+DOWNLOAD_BASE_URL = "https://mobile-maps-files.dnr.state.mn.us/file/"
 
-# Layer IDs in the MapServer
-LAYER_IDS = {
-    "water_trails": 0,
-    "ohv": 1,
-    "recreation": 2,
-    "state_parks": 3,
-    "state_forests": 4,
-    "water_access": 5,
-    "state_trails": 6,
-    "snowmobile": 7,
-    "trout_streams": 8,
+# Mapping of internal category names to DNR map_topic values
+TOPIC_MAP = {
+    "water_trails": "Water Trails",
+    "ohv": "Off-Highway Vehicle (OHV)",
+    "recreation": "Recreation Basemap",
+    "state_parks": "State Parks",
+    "state_forests": "State Forests",
+    "water_access": "Water Access",
+    "state_trails": "State Trails",
+    "snowmobile": "Snowmobile Trails",
+    "trout_streams": "Trout Angling",
 }
+
+# Reverse mapping for display/CLI
+CATEGORY_MAP = {v: k for k, v in TOPIC_MAP.items()}
 
 # Concurrency settings
 MAX_CONCURRENT_DOWNLOADS = 5
@@ -112,28 +112,46 @@ class GeoPDFMap:
         return 0
 
 
-async def fetch_maps_for_layer(
+async def fetch_token(client: httpx.AsyncClient) -> str:
+    """Fetch a temporary token for the ArcGIS service."""
+    try:
+        response = await client.get(TOKEN_URL)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("hosted_token", {}).get("token", "")
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        console.print(f"[red]Failed to fetch auth token: {e}[/]")
+        return ""
+
+
+async def fetch_maps_for_category(
     client: httpx.AsyncClient,
-    layer_id: int,
-    layer_name: str,
+    category: str,
+    token: str,
 ) -> list[GeoPDFMap]:
-    """Fetch all GeoPDF maps for a given layer."""
-    # Build the query URL through the proxy
-    query_url = (
-        f"{GEOPDF_INDEX_URL}/{layer_id}/query"
-        f"?where=1%3D1&outFields=*&f=json"
-    )
-    proxied_url = f"{PROXY_URL}?{query_url}"
+    """Fetch all GeoPDF maps for a given category."""
+    topic = TOPIC_MAP.get(category)
+    if not topic:
+        return []
+
+    params = {
+        "where": f"map_topic='{topic}'",
+        "outFields": "map_topic,map_name,file_dir_name,size,collection_name,epsg_code,doc_url",
+        "returnGeometry": "false",
+        "f": "json",
+        "token": token,
+    }
 
     try:
-        response = await client.get(
-            proxied_url,
-            headers={"Referer": REFERER},
-        )
+        response = await client.get(FEATURE_SERVER_URL, params=params)
         response.raise_for_status()
         data = response.json()
     except (httpx.HTTPError, ValueError) as e:
-        console.print(f"[red]Failed to fetch {layer_name}: {e}[/]")
+        console.print(f"[red]Failed to fetch {category}: {e}[/]")
+        return []
+
+    if "error" in data:
+        console.print(f"[red]API Error for {category}: {data['error'].get('message', 'Unknown error')}[/]")
         return []
 
     maps: list[GeoPDFMap] = []
@@ -141,15 +159,22 @@ async def fetch_maps_for_layer(
 
     for feature in features:
         attrs = feature.get("attributes", {})
+        
+        # Use doc_url if available, otherwise construct from file_dir_name
         doc_url = attrs.get("doc_url", "")
+        if not doc_url:
+            file_dir_name = attrs.get("file_dir_name", "")
+            if file_dir_name:
+                doc_url = f"{DOWNLOAD_BASE_URL}{file_dir_name}"
+        
         if not doc_url:
             continue
 
         maps.append(
             GeoPDFMap(
                 name=attrs.get("map_name", "Unknown"),
-                category=layer_name,
-                collection=attrs.get("collection_name", layer_name),
+                category=category,
+                collection=attrs.get("collection_name", category),
                 doc_url=doc_url,
                 size_str=attrs.get("size", "0 MB"),
                 epsg_code=attrs.get("epsg_code", ""),
@@ -166,16 +191,15 @@ async def fetch_all_maps(
     """Fetch all GeoPDF maps for the specified categories."""
     console.print("[bold blue]Fetching map list from DNR GeoPDF service...[/]")
 
+    token = await fetch_token(client)
+    if not token:
+        return []
+
     all_maps: list[GeoPDFMap] = []
 
     for category in categories:
-        layer_id = LAYER_IDS.get(category)
-        if layer_id is None:
-            console.print(f"[yellow]Unknown category: {category}[/]")
-            continue
-
         console.print(f"  Fetching {category}...")
-        maps = await fetch_maps_for_layer(client, layer_id, category)
+        maps = await fetch_maps_for_category(client, category, token)
         console.print(f"    Found {len(maps)} maps")
         all_maps.extend(maps)
 
@@ -320,7 +344,7 @@ async def async_main(args: argparse.Namespace) -> int:
 
     # Determine which categories to fetch
     if args.category == "all":
-        categories = list(LAYER_IDS.keys())
+        categories = list(TOPIC_MAP.keys())
     else:
         categories = [args.category]
 
@@ -352,7 +376,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Download GeoPDFs for Minnesota DNR recreation areas",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Categories:
   state_parks    State park maps (default)
   state_forests  State forest maps
@@ -382,7 +406,7 @@ Categories:
         "-c",
         "--category",
         default="state_parks",
-        choices=list(LAYER_IDS.keys()) + ["all"],
+        choices=list(TOPIC_MAP.keys()) + ["all"],
         help="Category of maps to download (default: state_parks)",
     )
 
